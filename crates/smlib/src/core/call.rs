@@ -1,0 +1,62 @@
+//! How this crate makes a solidcore-ops call ([`ops`]): what [`super::run_on`] gives a call
+//! this crate runs on the kernel itself, given to one solidcore-ops runs on its own session.
+//!
+//! - **Fixes:** the session's kernels run with this crate's fixes ([`super::fixes`]), named to
+//!   it before the first call.
+//! - **Stopping:** the token over this thread's work ([`crate::stop`]) is over the call.
+//! - **Failures:** while a dump folder is set ([`super::dump::set_dir`]), the session hands a
+//!   failed call's inputs to [`super::dump::written`].
+//! - **The call running now** ([`super::dump::current`]) and the profiler's span, as
+//!   [`super::run_on`] keeps them.
+//! - **Errors:** solidcore-ops' error as this crate's ([`error`]).
+
+use std::sync::Once;
+
+use crate::{Error, Result};
+
+/// Names this crate's fixes to solidcore-ops' session, once: every kernel it makes or hands out
+/// from then on runs with them.
+fn configured() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let fixes = super::fixes();
+        let on = fixes.flags().filter(|(_, on)| *on).map(|(name, _)| name);
+        if let Err(e) = solidcore_ops::session::set_fixes(on) {
+            log::warn!(target: "smlib", "solidcore-ops' session did not take the fixes: {e}");
+        }
+    });
+}
+
+/// Runs the solidcore-ops call `f`, named `call` for the profiler, the crash reports and a
+/// stopped call's error.
+pub(crate) fn ops<T>(call: &'static str, f: impl FnOnce() -> solidcore_ops::Result<T>) -> Result<T> {
+    configured();
+    let stop = crate::stop::token();
+    if stop.as_ref().is_some_and(solidcore_ops::cancel::CancelToken::is_cancelled) {
+        return Err(Error::Cancelled(call));
+    }
+    let _span = solidcraft_profile::span("solidcore", call);
+    let in_flight = super::dump::in_flight(call);
+    let r = match &stop {
+        Some(token) => solidcore_ops::cancel::within(token, f),
+        None => f(),
+    };
+    drop(in_flight);
+    r.map_err(|e| error(call, e))
+}
+
+/// solidcore-ops' error as this crate's: the ones this crate has a kind for as that kind, any
+/// other as [`Error::Solidcore`] with the call's name before it, as a kernel error of a call
+/// this crate runs itself reads.
+pub(crate) fn error(call: &'static str, e: solidcore_ops::Error) -> Error {
+    use solidcore_ops::Error as Ops;
+    match e {
+        Ops::Argument => Error::Argument,
+        Ops::Empty => Error::Empty,
+        Ops::NotSolid => Error::NotSolid,
+        Ops::Exception => Error::Exception,
+        Ops::Cancelled => Error::Cancelled(call),
+        Ops::Internal(what) => Error::Internal(what),
+        e => Error::Solidcore(format!("{call}: {e}")),
+    }
+}

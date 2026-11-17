@@ -27,9 +27,15 @@ thread_local! {
     pub(crate) static SERIALISED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Where failing calls leave their inputs; `None` stops it.
+/// Where failing calls leave their inputs; `None` stops it. While a folder is set, solidcore-ops'
+/// session hands the inputs of its failed calls here too ([`written`]); with none it has no
+/// callback, so a call that consumes its operands does not write them before it runs.
 pub(crate) fn set_dir(dir: Option<PathBuf>) {
+    let hook: Option<solidcore_ops::session::Hook> = dir
+        .is_some()
+        .then(|| std::sync::Arc::new(|f: &solidcore_ops::session::Failure<'_>| written(f.call, f.why, &f.inputs)) as solidcore_ops::session::Hook);
     *DIR.lock().unwrap_or_else(PoisonError::into_inner) = dir;
+    solidcore_ops::session::set_failure_hook(hook);
 }
 
 /// `b` as a binary `.smb`.
@@ -46,12 +52,21 @@ fn safe(call: &str) -> String {
 /// The running call failed: its `inputs` go to the folder, as they are now (a call that edits a
 /// body in place, a query's caches, leaves it edited). Failing to write them fails nothing else.
 pub(super) fn failed(k: &Kernel, call: &str, why: &str, inputs: Inputs<'_>) {
+    if DIR.lock().unwrap_or_else(PoisonError::into_inner).is_none() {
+        return;
+    }
+    let inputs: Vec<_> = inputs.iter().map(|&(what, body)| (what, serialise(k, &body.kernel()))).collect();
+    written(call, why, &inputs);
+}
+
+/// A failed call's inputs, each already a binary `.smb` (or why it could not be written), go to
+/// the folder: a call this crate ran ([`failed`]), or one solidcore-ops' session ran.
+pub(super) fn written(call: &str, why: &str, inputs: &[(&'static str, std::result::Result<Vec<u8>, String>)]) {
     let Some(dir) = DIR.lock().unwrap_or_else(PoisonError::into_inner).clone() else { return };
     let n = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let stem = format!("{n:06}-{}", safe(call));
     let mut text = format!("{call} -> {why}\nnumeric arguments are not recorded\n");
-    for &(what, body) in inputs {
-        let bytes = serialise(k, &body.kernel());
+    for (what, bytes) in inputs {
         match bytes {
             Ok(b) => {
                 let name = format!("{stem}-{what}.smb");
